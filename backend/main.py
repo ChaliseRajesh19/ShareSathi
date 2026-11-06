@@ -20,6 +20,10 @@ from financial_analysis_service import analyze_financial_reports
 from fastapi import Query
 from financial_comparison_service import compare_companies
 import logging
+from fastapi import HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from price_alerts import check_price_alerts
 
 logger = logging.getLogger(__name__)
 load_dotenv()
@@ -67,6 +71,12 @@ class PortfolioRequest(BaseModel):
 
 class SavedPortfolioRequest(BaseModel):
     current_prices: dict[str, float]
+
+
+class PriceAlertCreate(BaseModel):
+    symbol: str = Field(min_length=1, max_length=20)
+    condition: str
+    target_price: float = Field(gt=0)
 
 
 def get_transactions(connection):
@@ -273,9 +283,37 @@ def calculate_saved_portfolio(request: SavedPortfolioRequest):
         )
 
 
+class WatchlistInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    symbol: str = Field(min_length=1, max_length=20)
+
+
+class WatchlistResponse(BaseModel):
+    symbol: str
+    created_at: datetime
+
+
 @app.get("/api/prices")
 def get_prices():
-    return get_market_prices()
+    try:
+        market_data = get_market_prices()
+
+        if not market_data.get("stale", False):
+            check_price_alerts(
+                engine=engine,
+                user_id=DEV_USER_ID,
+                prices=market_data.get("prices", []),
+            )
+
+        return market_data
+
+    except RuntimeError as exc:
+        logger.exception("Failed to retrieve market prices")
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
 
 
 @app.get("/api/ipos")
@@ -398,4 +436,318 @@ def get_financial_comparison(
         raise HTTPException(
             status_code=502,
             detail=str(exc),
+        ) from exc
+
+
+@app.get("/api/watchlist")
+def get_watchlist():
+    try:
+        with engine.connect() as connection:
+            rows = (
+                connection.execute(
+                    text("""
+                        SELECT symbol, created_at
+                        FROM public.watchlist
+                        WHERE user_id = CAST(:user_id AS uuid)
+                        ORDER BY created_at DESC
+                    """),
+                    {"user_id": DEV_USER_ID},
+                )
+                .mappings()
+                .all()
+            )
+
+        return {
+            "watchlist": [
+                {
+                    "symbol": row["symbol"],
+                    "created_at": row["created_at"].isoformat(),
+                }
+                for row in rows
+            ]
+        }
+
+    except SQLAlchemyError:
+        logger.exception("Failed to retrieve watchlist")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not retrieve watchlist.",
+        )
+
+
+@app.post("/api/watchlist")
+def add_to_watchlist(request: WatchlistInput):
+    symbol = request.symbol.upper()
+
+    if not symbol.replace(".", "").replace("&", "").replace("-", "").isalnum():
+        raise HTTPException(
+            status_code=422,
+            detail="Enter a valid stock symbol.",
+        )
+
+    try:
+        with engine.begin() as connection:
+            row = (
+                connection.execute(
+                    text("""
+                        INSERT INTO public.watchlist (user_id, symbol)
+                        VALUES (CAST(:user_id AS uuid), :symbol)
+                        ON CONFLICT (user_id, symbol) DO NOTHING
+                        RETURNING symbol, created_at
+                    """),
+                    {
+                        "user_id": DEV_USER_ID,
+                        "symbol": symbol,
+                    },
+                )
+                .mappings()
+                .first()
+            )
+
+        if row is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{symbol} is already in your watchlist.",
+            )
+
+        return {
+            "message": f"{symbol} added to watchlist.",
+            "symbol": row["symbol"],
+            "created_at": row["created_at"].isoformat(),
+        }
+
+    except SQLAlchemyError:
+        logger.exception("Failed to add stock to watchlist")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not add stock to watchlist.",
+        )
+
+
+@app.delete("/api/watchlist/{symbol}")
+def remove_from_watchlist(symbol: str):
+    symbol = symbol.strip().upper()
+
+    try:
+        with engine.begin() as connection:
+            result = connection.execute(
+                text("""
+                    DELETE FROM public.watchlist
+                    WHERE user_id = CAST(:user_id AS uuid)
+                    AND symbol = :symbol
+                """),
+                {
+                    "user_id": DEV_USER_ID,
+                    "symbol": symbol,
+                },
+            )
+
+        if result.rowcount == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{symbol} is not in your watchlist.",
+            )
+
+        return {"message": f"{symbol} removed from watchlist."}
+
+    except SQLAlchemyError:
+        logger.exception("Failed to remove stock from watchlist")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not remove stock from watchlist.",
+        )
+
+
+@app.post("/api/price-alerts")
+def create_price_alert(alert: PriceAlertCreate):
+    symbol = alert.symbol.strip().upper()
+    condition = alert.condition.strip().lower()
+
+    if condition not in ("above", "below"):
+        raise HTTPException(
+            status_code=400,
+            detail="Condition must be 'above' or 'below'.",
+        )
+
+    try:
+        with engine.begin() as conn:
+            result = (
+                conn.execute(
+                    text("""
+                    INSERT INTO public.price_alerts
+                        (user_id, symbol, condition, target_price)
+                    VALUES
+                        (:user_id, :symbol, :condition, :target_price)
+                    RETURNING id, symbol, condition, target_price, status, created_at
+                """),
+                    {
+                        "user_id": DEV_USER_ID,
+                        "symbol": symbol,
+                        "condition": condition,
+                        "target_price": alert.target_price,
+                    },
+                )
+                .mappings()
+                .first()
+            )
+
+        return {"alert": dict(result)}
+
+    except Exception as e:
+        if "unique" in str(e).lower():
+            raise HTTPException(
+                status_code=409,
+                detail="This price alert already exists.",
+            )
+        raise HTTPException(status_code=500, detail="Could not create price alert.")
+
+
+@app.get("/api/price-alerts")
+def get_price_alerts():
+    with engine.connect() as conn:
+        rows = (
+            conn.execute(
+                text("""
+                SELECT id, symbol, condition, target_price, status,
+                       created_at, triggered_at
+                FROM public.price_alerts
+                WHERE user_id = :user_id
+                ORDER BY created_at DESC
+            """),
+                {"user_id": DEV_USER_ID},
+            )
+            .mappings()
+            .all()
+        )
+
+    return {"alerts": [dict(row) for row in rows]}
+
+
+@app.delete("/api/price-alerts/{alert_id}")
+def delete_price_alert(alert_id: int):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("""
+                DELETE FROM public.price_alerts
+                WHERE id = :alert_id AND user_id = :user_id
+                RETURNING id
+            """),
+            {
+                "alert_id": alert_id,
+                "user_id": DEV_USER_ID,
+            },
+        ).first()
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Price alert not found.")
+
+    return {"message": "Price alert deleted successfully."}
+
+
+@app.get("/api/notifications")
+def get_notifications():
+    try:
+        with engine.connect() as connection:
+            notifications = (
+                connection.execute(
+                    text("""
+                        SELECT
+                            id,
+                            alert_id,
+                            symbol,
+                            message,
+                            is_read,
+                            created_at
+                        FROM public.notifications
+                        WHERE user_id = CAST(:user_id AS uuid)
+                        ORDER BY created_at DESC
+                    """),
+                    {"user_id": DEV_USER_ID},
+                )
+                .mappings()
+                .all()
+            )
+
+            unread_count = sum(
+                1 for notification in notifications if not notification["is_read"]
+            )
+
+            return {
+                "notifications": [dict(notification) for notification in notifications],
+                "unread_count": unread_count,
+            }
+
+    except SQLAlchemyError as exc:
+        logger.exception("Failed to retrieve notifications")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve notifications.",
+        ) from exc
+
+
+@app.patch("/api/notifications/{notification_id}/read")
+def mark_notification_as_read(notification_id: int):
+    try:
+        with engine.begin() as connection:
+            result = (
+                connection.execute(
+                    text("""
+                    UPDATE public.notifications
+                    SET is_read = TRUE
+                    WHERE id = :notification_id
+                      AND user_id = CAST(:user_id AS uuid)
+                    RETURNING id, is_read
+                """),
+                    {
+                        "notification_id": notification_id,
+                        "user_id": DEV_USER_ID,
+                    },
+                )
+                .mappings()
+                .first()
+            )
+
+            if result is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Notification not found.",
+                )
+
+            return {
+                "message": "Notification marked as read.",
+                "notification": dict(result),
+            }
+
+    except SQLAlchemyError as exc:
+        logger.exception("Failed to mark notification as read")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update notification.",
+        ) from exc
+
+
+@app.patch("/api/notifications/read-all")
+def mark_all_notifications_as_read():
+    try:
+        with engine.begin() as connection:
+            result = connection.execute(
+                text("""
+                    UPDATE public.notifications
+                    SET is_read = TRUE
+                    WHERE user_id = CAST(:user_id AS uuid)
+                      AND is_read = FALSE
+                """),
+                {"user_id": DEV_USER_ID},
+            )
+
+            return {
+                "message": "All notifications marked as read.",
+                "updated_count": result.rowcount,
+            }
+
+    except SQLAlchemyError as exc:
+        logger.exception("Failed to mark all notifications as read")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update notifications.",
         ) from exc

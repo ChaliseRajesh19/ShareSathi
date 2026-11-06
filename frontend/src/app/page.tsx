@@ -11,6 +11,10 @@ import {
   type Portfolio,
   type MarketPricesResponse,
   type IPOOverview,
+  getNotifications,
+  markNotificationAsRead,
+  markAllNotificationsAsRead,
+  type Notification,
 } from "@/lib/api";
 
 import ExploreStocks from "./ExploreStocks";
@@ -67,6 +71,11 @@ export default function Home() {
   const [ipoCategory, setIpoCategory] = useState<
     "open" | "upcoming" | "closed"
   >("open");
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [notificationLoading, setNotificationLoading] = useState(false);
+  const [notificationError, setNotificationError] = useState("");
 
   useEffect(() => {
     if (active !== "IPO Intelligence") return;
@@ -145,6 +154,9 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
+  }, []);
+  useEffect(() => {
+    void loadNotifications();
   }, []);
 
 
@@ -351,6 +363,52 @@ export default function Home() {
     }
   };
 
+  const loadNotifications = async () => {
+    setNotificationLoading(true);
+    setNotificationError("");
+
+    try {
+      const result = await getNotifications();
+      setNotifications(result.notifications);
+      setUnreadCount(result.unread_count);
+    } catch (error) {
+      setNotificationError(
+        error instanceof Error
+          ? error.message
+          : "Failed to load notifications."
+      );
+    } finally {
+      setNotificationLoading(false);
+    }
+  };
+  const handleMarkAsRead = async (notification: Notification) => {
+    if (notification.is_read) return;
+
+    try {
+      await markNotificationAsRead(notification.id);
+      await loadNotifications();
+    } catch (error) {
+      setNotificationError(
+        error instanceof Error
+          ? error.message
+          : "Failed to update notification."
+      );
+    }
+  };
+
+  const handleMarkAllAsRead = async () => {
+    try {
+      await markAllNotificationsAsRead();
+      await loadNotifications();
+    } catch (error) {
+      setNotificationError(
+        error instanceof Error
+          ? error.message
+          : "Failed to update notifications."
+      );
+    }
+  };
+
 
   return (
     <main className="app-shell">
@@ -430,13 +488,81 @@ export default function Home() {
             </div>
 
 
-            <button
-              className="icon-button"
-              aria-label="Notifications"
-              title="Notifications"
-            >
-              ♧
-            </button>
+            <div className="notification-wrapper">
+              <button
+                className="icon-button"
+                aria-label="Notifications"
+                title="Notifications"
+                onClick={() => {
+                  const next = !showNotifications;
+                  setShowNotifications(next);
+
+                  if (next) {
+                    void loadNotifications();
+                  }
+                }}
+              >
+                ♧
+                {unreadCount > 0 && (
+                  <span className="notification-count">
+                    {unreadCount > 99 ? "99+" : unreadCount}
+                  </span>
+                )}
+              </button>
+
+              {showNotifications && (
+                <div className="notification-dropdown">
+                  <div className="notification-header">
+                    <strong>Notifications</strong>
+
+                    {unreadCount > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => void handleMarkAllAsRead()}
+                      >
+                        Mark all as read
+                      </button>
+                    )}
+                  </div>
+
+                  {notificationLoading ? (
+                    <p className="notification-empty">Loading...</p>
+                  ) : notificationError ? (
+                    <p className="notification-error">{notificationError}</p>
+                  ) : notifications.length === 0 ? (
+                    <p className="notification-empty">
+                      No notifications yet.
+                    </p>
+                  ) : (
+                    <div className="notification-list">
+                      {notifications.map((notification) => (
+                        <button
+                          type="button"
+                          key={notification.id}
+                          className={`notification-item ${notification.is_read ? "read" : "unread"
+                            }`}
+                          onClick={() => void handleMarkAsRead(notification)}
+                        >
+                          <strong>{notification.symbol}</strong>
+
+                          <span>{notification.message}</span>
+
+                          <small>
+                            {new Date(notification.created_at).toLocaleString()}
+                          </small>
+
+                          {!notification.is_read && (
+                            <span className="mark-read-label">
+                              Mark as read
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
             <div className="avatar">RC</div>
           </div>
         </header>

@@ -94,6 +94,33 @@ export type MarketPrice = {
     last_updated: string | null;
     is_live: boolean;
 };
+export type WatchlistItem = {
+    symbol: string;
+    created_at: string;
+};
+
+export function getWatchlist() {
+    return request<{ watchlist: WatchlistItem[] }>("/api/watchlist");
+}
+
+export function addToWatchlist(symbol: string) {
+    return request<{ message: string; symbol: string }>(
+        "/api/watchlist",
+        {
+            method: "POST",
+            body: JSON.stringify({ symbol }),
+        }
+    );
+}
+
+export function removeFromWatchlist(symbol: string) {
+    return request<{ message: string }>(
+        `/api/watchlist/${encodeURIComponent(symbol)}`,
+        {
+            method: "DELETE",
+        }
+    );
+}
 
 
 export type MarketPricesResponse = {
@@ -113,6 +140,44 @@ export type MarketPricesResponse = {
 
 export function getMarketPrices() {
     return request<MarketPricesResponse>("/api/prices");
+}
+export type Notification = {
+    id: number;
+    alert_id: number | null;
+    symbol: string;
+    message: string;
+    is_read: boolean;
+    created_at: string;
+};
+
+export type NotificationsResponse = {
+    notifications: Notification[];
+    unread_count: number;
+};
+
+export function getNotifications() {
+    return request<NotificationsResponse>("/api/notifications");
+}
+
+export function markNotificationAsRead(notificationId: number) {
+    return request<{
+        message: string;
+        notification: {
+            id: number;
+            is_read: boolean;
+        };
+    }>(`/api/notifications/${notificationId}/read`, {
+        method: "PATCH",
+    });
+}
+
+export function markAllNotificationsAsRead() {
+    return request<{
+        message: string;
+        updated_count: number;
+    }>("/api/notifications/read-all", {
+        method: "PATCH",
+    });
 }
 
 
